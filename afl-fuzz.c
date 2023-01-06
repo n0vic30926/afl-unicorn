@@ -25,6 +25,15 @@
 
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
+/*定义外设的内存地址*/
+#define SPI 1
+#define I2C 2
+#define GPIO 3
+#define UART 4
+#define SPI_ADDRESS 0x10000
+#define I2C_ADDRESS 0x20000
+#define GPIO_ADDRESS 0x30000
+#define UART_ADDRESS 0x40000
 
 #include "config.h"
 #include "types.h"
@@ -78,9 +87,11 @@
 
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
+/*定义一个字符串数组存放外设类型，以便后续进行数字和外设类型对应*/
 
 
-EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
+
+EXP_ST u8 *in_dir,                    /* Input diretcory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
           *out_dir,                   /* Working & output directory       */
           *sync_dir,                  /* Synchronization directory        */
@@ -123,7 +134,8 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            run_over10m,               /* Run time over 10 minutes?        */
            persistent_mode,           /* Running in persistent mode?      */
            deferred_mode,             /* Deferred forkserver mode?        */
-           fast_cal;                  /* Try to calibrate faster?         */
+           fast_cal,                  /* Try to calibrate faster?         */
+           fuzz_count;                /*The fuzzed seed counting*/
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -201,8 +213,9 @@ static u32 syncing_case;              /* Syncing with case #...           */
 static s32 stage_cur_byte,            /* Byte offset of current stage op  */
            stage_cur_val;             /* Value used for stage op          */
 
-static u8  stage_val_type;            /* Value type (STAGE_VAL_*)         */
-
+static u8  stage_val_type,            /* Value type (STAGE_VAL_*)         */
+           peri_type;                 /*用于标识当前种子属于哪种外设类型变异而来*/
+          
 static u64 stage_finds[32],           /* Patterns found per fuzz stage    */
            stage_cycles[32];          /* Execs per fuzz stage             */
 
@@ -236,7 +249,8 @@ struct queue_entry {
       has_new_cov,                    /* Triggers new coverage?           */
       var_behavior,                   /* Variable behavior?               */
       favored,                        /* Currently favored?               */
-      fs_redundant;                   /* Marked as redundant in the fs?   */
+      fs_redundant,                   /* Marked as redundant in the fs?   */
+      peri_type;                      /*用于标识种子属于哪种外设类型变异而来*/               
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
       exec_cksum;                     /* Checksum of the execution trace  */
@@ -247,9 +261,8 @@ struct queue_entry {
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
-
   struct queue_entry *next,           /* Next element, if any             */
-                     *next_100;       /* 100 elements ahead               */
+                     *next_100;       /* 100 elements ahead      
 
 };
 
@@ -257,6 +270,8 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
                           *queue_top, /* Top of the list                  */
                           *q_prev100; /* Previous 100 marker              */
+
+
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
@@ -274,7 +289,7 @@ static struct extra_data* a_extras;   /* Automatically selected extras    */
 static u32 a_extras_cnt;              /* Total number of tokens available */
 
 static u8* (*post_handler)(u8* buf, u32* len);
-
+static u8* peri_buf;   /*用于分配空间存储外设数据*/
 /* Interesting values, as per config.h */
 
 static s8  interesting_8[]  = { INTERESTING_8 };
@@ -774,7 +789,7 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 /* Append new test case to the queue. */
 
-static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
+static void add_to_queue(u8* fname, u32 len, u8 passed_det,u8 type) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
@@ -785,26 +800,97 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   if (q->depth > max_depth) max_depth = q->depth;
 
-  if (queue_top) {
+  /*根据种子所属的不同外设队列，加入到对应队列*/
+  /*
+  switch(peri_type){
+    case SPI:
+      if(!queue_peri[SPI]){
+        queue_peri[SPI] = q;
+        queue_peri_top[SPI] = q;
+      }
+      else {
+        queue_peri_top[SPI]->next = q;
+        queue_peri_top[SPI] = q;
+      }
+      break;
 
+    case I2C:
+      if(!queue_peri[I2C]){
+        queue_peri[I2C] = q;
+        queue_peri_top[I2C] = q;
+      }
+      else {
+        queue_peri_top[I2C]->next = q;
+        queue_peri_top[I2C] = q;
+      }
+       break;
+
+    case GPIO:
+      if(!queue_peri[GPIO]){
+        queue_peri[GPIO] = q;
+        queue_peri_top[GPIO] = q;
+      }
+      else {
+        queue_peri_top[GPIO]->next = q;
+        queue_peri_top[GPIO] = q;
+      }
+      break;
+
+    case UART:
+      if(!queue_peri[UART]){
+        queue_peri[UART] = q;
+        queue_peri_top[UART] = q;
+      }
+      else {
+        queue_peri_top[UART]->next = q;
+        queue_peri_top[UART] = q;
+      }
+      break;
+
+    case 0:
+      if (queue_top) {
+      queue_top->next = q;
+      queue_top = q;
+      } 
+      else q_prev100 = queue = queue_top = q;
+
+      queued_paths++;
+      pending_not_fuzzed++;
+
+      cycles_wo_finds = 0;
+
+      if (!(queued_paths % 100)) {
+
+        q_prev100->next_100 = q;
+        q_prev100 = q;
+
+      }
+
+      last_path_time = get_cur_time();
+      break;
+  }
+*/
+
+  if (queue_top) {
     queue_top->next = q;
     queue_top = q;
-
   } else q_prev100 = queue = queue_top = q;
 
-  queued_paths++;
-  pending_not_fuzzed++;
+    queued_paths++;
+    pending_not_fuzzed++;
 
-  cycles_wo_finds = 0;
+    q->peri_type = type;
 
-  if (!(queued_paths % 100)) {
+    cycles_wo_finds = 0;
 
-    q_prev100->next_100 = q;
-    q_prev100 = q;
+    if (!(queued_paths % 100)) {
+      q_prev100->next_100 = q;
+      q_prev100 = q;
 
-  }
+    }
 
-  last_path_time = get_cur_time();
+    last_path_time = get_cur_time();
+    break;
 
 }
 
@@ -1317,6 +1403,7 @@ static void cull_queue(void) {
 
       /* Remove all bits belonging to the current entry from temp_v. */
 
+
       while (j--) 
         if (top_rated[i]->trace_mini[j])
           temp_v[j] &= ~top_rated[i]->trace_mini[j];
@@ -1328,7 +1415,27 @@ static void cull_queue(void) {
 
     }
 
-  q = queue;
+
+
+/*自我改写，不知对错，先试试：针对favored种子的判断*/
+/*是否只要确定该种子的tc->ref是否为0，即可知道它是否为favored种子*/
+/*因为q->tc_ref这个参数在整个afl中也没被用到，猜测作者是有类似的灵感，但没得到应用*/
+/*tc_ref用于记录每个种子在bitmap上top_rated的个数，而cull_queue的逻辑就是，筛去那些个数为0的种子*/
+/*因此直接用该参数即可，相当于从遍历bitmap位图，改为遍历种子队列*/
+/*
+
+ while(q){
+    if(q->tc_ref){
+        q->favored = 1;
+        queued_favored++;
+        if (!q->was_fuzzed) pending_favored++;
+    }
+    q = q->next;
+  }
+
+*/
+
+q = queue;  
 
   while (q) {
     mark_as_redundant(q, !q->favored);
@@ -1408,7 +1515,9 @@ static void read_testcases(void) {
   struct dirent **nl;
   s32 nl_cnt;
   u32 i;
-  u8* fn;
+  u8* fn,cmb_buf;
+  s32 fd;
+  u64 sum = 0;
 
   /* Auto-detect non-in-place resumption attempts. */
 
@@ -1421,7 +1530,7 @@ static void read_testcases(void) {
      the ordering  of test cases would vary somewhat randomly and would be
      difficult to control. */
 
-  nl_cnt = scandir(in_dir, &nl, NULL, alphasort);
+  nl_cnt = scandir(in_dir, &nl, NULL, alphasort) - 1;
 
   if (nl_cnt < 0) {
 
@@ -1443,17 +1552,39 @@ static void read_testcases(void) {
     shuffle_ptrs((void**)nl, nl_cnt);
 
   }
+   
 
-  for (i = 0; i < nl_cnt; i++) {
+  //for (i = 0; i < nl_cnt; i++) {
 
-    struct stat st;
 
-    u8* fn = alloc_printf("%s/%s", in_dir, nl[i]->d_name);
+  
+  /*将各外设数据拼凑成一个合并种子后，写入文件*/
+  //  u8* fn = alloc_printf("%s/%s", in_dir, nl[i]->d_name);
+    u8* fn = alloc_printf("%s/%s/%s", in_dir, nl_cnt, nl_cnt);
     u8* dfn = alloc_printf("%s/.state/deterministic_done/%s", in_dir, nl[i]->d_name);
+    u8* dn = alloc_printf("%s/%s", in_dir, nl_cnt);
 
+
+    u8* fn1 = alloc_printf("%s/%s/%s", in_dir, nl_cnt, 'SPI');
+    u8* fn2 = alloc_printf("%s/%s/%s", in_dir, nl_cnt, 'I2C');
+    u8* fn3 = alloc_printf("%s/%s/%s", in_dir, nl_cnt, 'GPIO');
+    u8* fn4 = alloc_printf("%s/%s/%s", in_dir, nl_cnt, 'UART');
+
+
+    cmb_buf = cmb_peri(fn1,fn2,fn3,fn4);
+    
+    /*将合并种子写入文件*/
+    fd = open(fn, O_RDWR|O_CREAT|O_APPEND,0777);
+    ck_write(fd,cmb_buf,peri_buf - cmb_buf,fn);
+    close(fd);
+    ck_free(peri_buf);
+    ck_free(cmb_buf);
+    peri_buf = NULL;
+
+  /*后面保持不变*/
     u8  passed_det = 0;
 
-    free(nl[i]); /* not tracked */
+  //  free(nl[i]); /* not tracked */
  
     if (lstat(fn, &st) || access(fn, R_OK))
       PFATAL("Unable to access '%s'", fn);
@@ -1465,7 +1596,6 @@ static void read_testcases(void) {
       ck_free(fn);
       ck_free(dfn);
       continue;
-
     }
 
     if (st.st_size > MAX_FILE) 
@@ -1480,9 +1610,9 @@ static void read_testcases(void) {
     if (!access(dfn, F_OK)) passed_det = 1;
     ck_free(dfn);
 
-    add_to_queue(fn, st.st_size, passed_det);
+    add_to_queue(fn, st.st_size, passed_det,0);
 
-  }
+  //}
 
   free(nl); /* not tracked */
 
@@ -1502,6 +1632,104 @@ static void read_testcases(void) {
   queued_at_start = queued_paths;
 
 }
+
+/*用于读取外设内存地址上的数据，并写入文件中*/
+static void write_peri(u64 addr) {
+  u64 *buffer;
+  u8  *fn,dn;
+  s32 fd;
+  struct dirent **nl;
+  s32 nl_cnt;
+
+  /*使用scandir扫描输入目录中的种子数，这样在第二轮的时候以种子数命名时就会依次递增，不会和第一轮的种子冲突覆盖*/
+  nl_cnt = scandir(in_dir, &nl, NULL, alphasort);
+
+  /*在第一次进入时若无文件夹，则在in_dir里创建一个文件夹，用于存放主种子及其每个外设的部分*/
+  dn = alloc_printf("%s/%s",in_dir,nl_cnt);
+  mkdir(dn, 0777)；
+
+  /*根据addr判断所读取的外设类型,并创建对应外设的种子文件用于存放每部分外设的数据*/
+  if(addr == SPI_ADDRESS){
+    buffer = addr + SPI_OFFSET;
+    fn =  alloc_printf("%s/%s/SPI",in_dir,nl_cnt);
+    fd = open(fn, O_RDWR|O_CREAT|O_APPEND,0777);
+    ck_write(fd,buffer,SPI_LEN,fn);
+    close(fd);
+  }
+
+  else if(addr == UART_ADDRESS){
+    buffer = addr + UART_OFFSET;
+    fn = alloc_printf("%s/%s/UART",in_dir,nl_cnt);
+    fd = open(fn, O_RDWR|O_CREAT|O_APPEND,0777);
+    ck_write(fd,buffer,UART_LEN,fn);
+    close(fd);
+  }
+
+  else if(addr == GPIO_ADDRESS){
+    buffer = addr + GPIO_OFFSET;
+    fn = alloc_printf("%s/%s/GPIO",in_dir,nl_cnt);
+    fd = open(fn, O_RDWR|O_CREAT|O_APPEND,0777);
+    ck_write(fd,buffer,GPIO_LEN,fn);
+    close(fd);
+  }
+
+  else if(addr == I2C_ADDRESS){
+    buffer = addr + I2C_OFFSET;
+    fn = alloc_printf("%s/%s/I2C",in_dir,nl_cnt);
+    fd = open(fn, O_RDWR|O_CREAT|O_APPEND,0777);
+    ck_write(fd,buffer,I2C_LEN,fn);
+    close(fd);
+  }
+  free(nl);
+
+}
+
+/*用于将文件中的外设数据读取到内存*/
+static u64 read_peri(u8* fn) {
+  u32 i;
+  s32 fd;
+  struct stat st;
+
+  if (fn == 'null')return 0;
+  
+  stat(fn, &st);
+
+  fd = open(fn, O_RDWR|O_CREAT|O_APPEND,0777);
+  ck_read(fd,peri_buf,st.st_size,fn);
+  close(fd);
+  return st.st_size;
+}
+
+/*用于将从文件中外设数据合并*/
+static u8* cmb_peri(u8* fn1,u8* fn2,u8* fn3,u8* fn4){
+  u64 sum = 0,tmp;
+  u8* cmb_buf;
+  s32 fd; 
+
+ /*开辟一块内存空间用于存储读取进来的外设数据，以便后续的合并操作*/
+  peri_buf = ck_alloc(8*20);
+  cmb_buf = peri_buf;
+
+  /*将各外设数据写入内存,并统计合并种子的大小*/
+  tmp = read_peri(fn1);
+  sum += tmp;
+  peri_buf += tmp;//移动指针
+
+  tmp = read_peri(fn2);
+  sum += tmp;
+  peri_buf += tmp;//移动指针
+
+  tmp = read_peri(fn3);
+  sum += tmp;
+  peri_buf += tmp;//移动指针
+
+  tmp = read_peri(fn4);
+  sum += tmp;
+  peri_buf += tmp;//移动指针
+
+  return cmb_buf;
+}
+
 
 
 /* Helper function for load_extras. */
@@ -1781,11 +2009,11 @@ static void maybe_add_auto(u8* mem, u32 len) {
   if (!MAX_AUTO_EXTRAS || !USE_AUTO_EXTRAS) return;
 
   /* Skip runs of identical bytes. */
-
+ /*逐个比较首字节和其余字节的情况，看看是到第几个字节才开始不同，并根据payload长度的不同作抉择*/
   for (i = 1; i < len; i++)
     if (mem[0] ^ mem[i]) break;
 
-  if (i == len) return;
+  if (i == len) return;//如果全相同则直接返回
 
   /* Reject builtin interesting values. */
 
@@ -3001,7 +3229,6 @@ static void pivot_inputs(void) {
       nfn = alloc_printf("%s/queue/id_%06u", out_dir, id);
 
 #endif /* ^!SIMPLE_FILES */
-
     }
 
     /* Pivot to the new queue entry. */
@@ -3114,7 +3341,6 @@ static void write_crash_readme(void) {
 
 }
 
-
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
@@ -3131,24 +3357,24 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
-    if (!(hnb = has_new_bits(virgin_bits))) {
-      if (crash_mode) total_crashes++;
-      return 0;
+    if (!(hnb = has_new_bits(virgin_bits))) {   
+      if (crash_mode) total_crashes++;    
+      return 0;   
     }    
 
 #ifndef SIMPLE_FILES
-
-    fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths,
+    
+    fn = alloc_printf("%s/queue/id:%s,%s", out_dir, queued_paths,
                       describe_op(hnb));
 
 #else
 
-    fn = alloc_printf("%s/queue/id_%06u", out_dir, queued_paths);
+    fn = alloc_printf("%s/queue/id_%s", out_dir, queued_paths);
 
 #endif /* ^!SIMPLE_FILES */
 
-    add_to_queue(fn, len, 0);
-
+    add_to_queue(fn, len, 0, peri_type);
+    
     if (hnb == 2) {
       queue_top->has_new_cov = 1;
       queued_with_cov++;
@@ -4465,7 +4691,7 @@ static u32 next_p2(u32 val) {
    trimmer uses power-of-two increments somewhere between 1/16 and 1/1024 of
    file size, to keep the stage short and sweet. */
 
-static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
+static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf，s32 len) {
 
   static u8 tmp[64];
   static u8 clean_trace[MAP_SIZE];
@@ -4479,14 +4705,14 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
      detected, it will still work to some extent, so we don't check for
      this. */
 
-  if (q->len < 5) return 0;
+  if (len < 5) return 0;
 
   stage_name = tmp;
-  bytes_trim_in += q->len;
+  bytes_trim_in += len;
 
   /* Select initial chunk len, starting with large steps. */
 
-  len_p2 = next_p2(q->len);
+  len_p2 = next_p2(len);
 
   remove_len = MAX(len_p2 / TRIM_START_STEPS, TRIM_MIN_BYTES);
 
@@ -4500,14 +4726,14 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
     sprintf(tmp, "trim %s/%s", DI(remove_len), DI(remove_len));
 
     stage_cur = 0;
-    stage_max = q->len / remove_len;
+    stage_max = len / remove_len;
 
-    while (remove_pos < q->len) {
+    while (remove_pos < len) {
 
-      u32 trim_avail = MIN(remove_len, q->len - remove_pos);
+      u32 trim_avail = MIN(remove_len, len - remove_pos);
       u32 cksum;
 
-      write_with_gap(in_buf, q->len, remove_pos, trim_avail);
+      write_with_gap(in_buf, len, remove_pos, trim_avail);
 
       fault = run_target(argv, exec_tmout);
       trim_execs++;
@@ -4525,10 +4751,10 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
       if (cksum == q->exec_cksum) {
 
-        u32 move_tail = q->len - remove_pos - trim_avail;
+        u32 move_tail = len - remove_pos - trim_avail;
 
-        q->len -= trim_avail;
-        len_p2  = next_p2(q->len);
+        len -= trim_avail;
+        len_p2  = next_p2(len);
 
         memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail, 
                 move_tail);
@@ -4590,18 +4816,51 @@ abort_trimming:
    a helper function for fuzz_one(). */
 
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
-
+  u8*fn;
+  s32 fd;
+  u32*pfn;
   u8 fault;
+  u8 if_save;
 
   if (post_handler) {
-
+ 
     out_buf = post_handler(out_buf, &len);
     if (!out_buf || !len) return 0;
-
   }
 
-  write_to_testcase(out_buf, len);
+  //这里要执行2次该函数，第1次将修改后的外设部分先写入，待与其他部分拼接后，再次将拼接后的种子覆盖原文件并执行
+  write_to_testcase(out_buf, len);  
 
+  //暂时先使用queued_paths
+  u8* fn1 = alloc_printf("%s/%s/%s", out_dir, queued_paths, 'SPI');
+  u8* fn2 = alloc_printf("%s/%s/%s", out_dir, queued_paths, 'I2C');
+  u8* fn3 = alloc_printf("%s/%s/%s", out_dir, queued_paths, 'GPIO');
+  u8* fn4 = alloc_printf("%s/%s/%s", out_dir, queued_paths, 'UART');
+
+  /*若找不到该文件或文件内容为空，则要将fn置null*/
+  //将当前修改后的外设与其他外设部分拼接
+  switch(peri_type){
+    case SPI:
+      out_buf = cmb_peri(out_file,fn2,fn3,fn4);
+      break;
+
+    case I2C:
+      out_buf = cmb_peri(fn1,out_file,fn3,fn4);
+      break; 
+
+    case GPIO:
+      out_buf = cmb_peri(fn1,fn2,out_file,fn4);
+      break; 
+
+    case UART:
+      out_buf = cmb_peri(fn1,fn2,fn3,out_file);
+      break; 
+  }  
+
+  //将合并后的out_buf写入/out_dir/.cur_input文件中
+  write_to_testcase(out_buf, len);  
+
+  
   fault = run_target(argv, exec_tmout);
 
   if (stop_soon) return 1;
@@ -4627,16 +4886,17 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   }
 
   /* This handles FAULT_ERROR for us: */
+ //如果是interesting种子，则将其输出到日志
+  if_save = save_if_interesting(argv, out_buf, len, fault);
 
-  queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+  queued_discovered += if_save;
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
 
   return 0;
-
+ 
 }
-
 
 /* Helper to choose random block len for block operations in fuzz_one().
    Doesn't return zero, provided that max_len is > 0. */
@@ -4679,7 +4939,6 @@ static u32 choose_block_len(u32 limit) {
   return min_value + UR(MIN(max_value, limit) - min_value + 1);
 
 }
-
 
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
@@ -4945,14 +5204,18 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 static u8 fuzz_one(char** argv) {
 
   s32 len, fd, temp_len, i, j;
-  u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
+  u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0，*static_map =0;//定义一个与eff_map类似的static_map，实现变异时保持特定数据的固定
   u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
-
+  u8 peri_type = 0; 
   u8  ret_val = 1, doing_det = 0;
+  struct stat st;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
+  u32*pfn;
+  u8*fn;
+  peri_type++;  
 
 #ifdef IGNORE_FINDS
 
@@ -4962,34 +5225,35 @@ static u8 fuzz_one(char** argv) {
   if (queue_cur->depth > 1) return 1;
 
 #else
+  
+    if (pending_favored) {
 
-  if (pending_favored) {
+      /* If we have any favored, non-fuzzed new arrivals in the queue,
+        possibly skip to them at the expense of already-fuzzed or non-favored
+        cases. */
 
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
+      if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
+          UR(100) < SKIP_TO_NEW_PROB){printf("当前种子以99%概率被刷");return 1;}
 
-    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
-        UR(100) < SKIP_TO_NEW_PROB) return 1;
+    } 
+    else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
 
-  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
+      /* Otherwise, still possibly skip non-favored cases, albeit less often.
+        The odds of skipping stuff are higher for already-fuzzed inputs and
+        lower for never-fuzzed entries. */
 
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
+      if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
 
-    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
+        if (UR(100) < SKIP_NFAV_NEW_PROB) {printf("当前种子以75%概率被刷");return 1;}
+        
+      } else {
 
-      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
+        if (UR(100) < SKIP_NFAV_OLD_PROB) {printf("当前种子以95%概率被刷");return 1;}
 
-    } else {
+      }
 
-      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
-
-    }
-
-  }
-
+    
+}
 #endif /* ^IGNORE_FINDS */
 
   if (not_on_tty) {
@@ -4997,27 +5261,57 @@ static u8 fuzz_one(char** argv) {
          current_entry, queued_paths, unique_crashes);
     fflush(stdout);
   }
+  
+  //若区域内存未释放，则先释放空间再重新使用
+  if(peri_buf != NULL)ck_free(peri_buf);
+  peri_buf = ck_alloc(8*20);
 
+
+  /*在读入testcase时进行判断,将对应的外设文件读取并替换内存中的out_buf文件并获取其长度len，代替主种子执行变异阶段*/
+  switch(peri_type){
+    case SPI:
+      fn = alloc_printf("%s/%s/%s", out_dir, queue_cur->fname, 'SPI');
+      break;
+
+    case I2C:
+      fn = alloc_printf("%s/%s/%s", out_dir, queue_cur->fname, 'I2C');
+      break; 
+
+    case GPIO:
+      fn = alloc_printf("%s/%s/%s", out_dir, queue_cur->fname, 'GPIO');
+      break; 
+
+    case UART:
+      fn = alloc_printf("%s/%s/%s", out_dir, queue_cur->fname, 'UART');
+      break; 
+  }
+  
+  //获取当前文件的大小
+  stat(fn,&st);
+  len = st.st_size;
+  
   /* Map the test case into memory. */
-
-  fd = open(queue_cur->fname, O_RDONLY);
-
+ 
+  //fd = open(queue_cur->fname, O_RDONLY);
+  fd = open(fn, O_RDONLY);
   if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
 
-  len = queue_cur->len;
+  //len = queue_cur->len;
 
   orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
   if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
 
   close(fd);
+  
+
 
   /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
      single byte anyway, so it wouldn't give us any performance or memory usage
      benefits. */
 
   out_buf = ck_alloc_nozero(len);
-
+   
   subseq_tmouts = 0;
 
   cur_depth = queue_cur->depth;
@@ -5026,6 +5320,9 @@ static u8 fuzz_one(char** argv) {
    * CALIBRATION (only if failed earlier on) *
    *******************************************/
 
+
+//由于in_buf和queue_cur已经不对应，这里暂时先不校准
+/*
   if (queue_cur->cal_failed) {
 
     u8 res = FAULT_TMOUT;
@@ -5045,14 +5342,17 @@ static u8 fuzz_one(char** argv) {
     }
 
   }
+*/
 
   /************
    * TRIMMING *
    ************/
 
+/*这里将trim_case中的len手动输入，用外部输入的len替换原始的q->len*/
+
   if (!dumb_mode && !queue_cur->trim_done) {
 
-    u8 res = trim_case(argv, queue_cur, in_buf);
+    u8 res = trim_case(argv, queue_cur, in_buf，len);
 
     if (res == FAULT_ERROR)
       FATAL("Unable to execute target application");
@@ -5093,9 +5393,17 @@ static u8 fuzz_one(char** argv) {
 
   doing_det = 1;
 
+
+/*正式进入变异阶段，先初始化static_map,以比特为单位，因此长度为len *8 */
+  
+  static_map = ck_alloc(len << 3);
+  
+
+
   /*********************************************
    * SIMPLE BITFLIP (+dictionary construction) *
    *********************************************/
+  
 
 #define FLIP_BIT(_ar, _b) do { \
     u8* _arf = (u8*)(_ar); \
@@ -5167,8 +5475,9 @@ static u8 fuzz_one(char** argv) {
         if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
           maybe_add_auto(a_collect, a_len);
 
-      } else if (cksum != prev_cksum) {
-
+      } 
+      else if (cksum != prev_cksum) {
+      /*如果出现了和之前连续相同的种子不一样的i情况，则进行记录 ，并从这里重新开始*/
         /* Otherwise, if the checksum has changed, see if we have something
            worthwhile queued up, and collect that if the answer is yes. */
 
@@ -5182,7 +5491,7 @@ static u8 fuzz_one(char** argv) {
 
       /* Continue collecting string, but only if the bit flip actually made
          any difference - we don't want no-op tokens. */
-
+      /*和最开始的种子不一样，则持续累加*/
       if (cksum != queue_cur->exec_cksum) {
 
         if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];        
@@ -5262,7 +5571,6 @@ static u8 fuzz_one(char** argv) {
      EFF_APOS      - position of a particular file offset in the map.
      EFF_ALEN      - length of a map with a particular number of bytes.
      EFF_SPAN_ALEN - map span for a sequence of bytes.
-
    */
 
 #define EFF_APOS(_p)          ((_p) >> EFF_MAP_SCALE2)
@@ -5313,7 +5621,8 @@ static u8 fuzz_one(char** argv) {
         cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
       else
         cksum = ~queue_cur->exec_cksum;
-
+     
+      /*计算翻转该byte后的bitmap hash值，如果不一样就计入*/
       if (cksum != queue_cur->exec_cksum) {
         eff_map[EFF_APOS(stage_cur)] = 1;
         eff_cnt++;
@@ -5435,7 +5744,7 @@ skip_bitflip:
   stage_name  = "arith 8/8";
   stage_short = "arith8";
   stage_cur   = 0;
-  stage_max   = 2 * len * ARITH_MAX;
+  stage_max   = 2 * len * ARITH_MAX; //一个byte执行2*35次，一共有len个byte
 
   stage_val_type = STAGE_VAL_LE;
 
@@ -6736,7 +7045,7 @@ static void sync_fuzzers(char** argv) {
         if (stop_soon) return;
 
         syncing_party = sd_ent->d_name;
-        queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
+        queued_imported += save_if_interesting(argv, mem, st.st_size,fault);
         syncing_party = 0;
 
         munmap(mem, st.st_size);
@@ -7721,6 +8030,7 @@ int main(int argc, char** argv) {
   u8  exit_1 = !!getenv("AFL_BENCH_JUST_ONE");
   char** use_argv;
 
+  struct queue_entry * q;
   struct timeval tv;
   struct timezone tz;
 
@@ -7974,7 +8284,18 @@ int main(int argc, char** argv) {
   init_count_class16();
 
   setup_dirs_fds();
-  read_testcases();
+
+  /*读取输入的部分*/
+  //中断();
+  write_peri(SPI_ADDRESS);
+  write_peri(I2C_ADDRESS);
+  write_peri(GPIO_ADDRESS);  
+  write_peri(UART_ADDRESS);
+
+  /*当所有初始输入都读取完毕后，进行拼接*/
+
+  read_testcases();//读取初始种子
+
   load_auto();
 
   pivot_inputs();
@@ -8020,11 +8341,10 @@ int main(int argc, char** argv) {
   while (1) {
 
     u8 skipped_fuzz;
-
     cull_queue();
+    peri_type = 0;  //用来判断当前应执行哪个外设部分
 
     if (!queue_cur) {
-
       queue_cycle++;
       current_entry     = 0;
       cur_skipped_paths = 0;
@@ -8059,7 +8379,13 @@ int main(int argc, char** argv) {
 
     }
 
-    skipped_fuzz = fuzz_one(use_argv);
+
+
+
+/*一个种子要执行4个不同的部分fuzz_one*/
+    for(int i = 0; i < 4; i++){
+      skipped_fuzz = fuzz_one(use_argv);
+    }
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
       
